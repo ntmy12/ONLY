@@ -77,7 +77,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         ritual_alpha_pos: Optional[torch.FloatTensor] = None,
         ritual_alpha_neg: Optional[torch.FloatTensor] = None,
         ritual_beta: Optional[torch.FloatTensor] = None,
-        js_gamma: Optional[torch.FloatTensor] = None, 
+        js_gamma: Optional[torch.FloatTensor] = None,
+        greedy: Optional[bool] = None,  # decoding flag read by only_sample.sample; unused in forward
         return_dict: Optional[bool] = None,
         tokenizer=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -258,5 +259,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         return model_inputs
     
     
-AutoConfig.register("llava", LlavaConfig)
-AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+try:
+    AutoConfig.register("llava", LlavaConfig, exist_ok=True)
+    AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM, exist_ok=True)
+except TypeError:
+    # Fallback for older transformers versions that don't support exist_ok
+    try:
+        AutoConfig.register("llava", LlavaConfig)
+        AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+    except ValueError:
+        pass

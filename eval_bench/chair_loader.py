@@ -6,7 +6,7 @@ from PIL import Image
 
 
 class CHAIRDataset(Dataset):
-    def __init__(self, data_path, anno_path, trans, model):
+    def __init__(self, data_path, anno_path, trans, model, img_files=None):
         self.data_path = data_path
         self.anno_path = anno_path
         self.trans = trans
@@ -32,8 +32,12 @@ class CHAIRDataset(Dataset):
         )
 
         self.img_dict = img_dict
-        self.img_files = os.listdir(self.data_path)
-        random.shuffle(self.img_files)
+        if img_files is not None:
+            # fixed, seed-selected image list shared by every model/method (see eval_common.select_chair_images)
+            self.img_files = list(img_files)
+        else:
+            self.img_files = os.listdir(self.data_path)
+            random.shuffle(self.img_files)
 
     def __len__(self):
         return len(self.img_files)

@@ -30,6 +30,7 @@ from PIL import Image
 from torchvision.transforms import v2
 
 from chair_loader import CHAIRDataset
+from eval_common import select_chair_images, done_keys, append_jsonl, CHAIR_PROMPT, CHAIR_MAX_NEW_TOKENS, CHAIR_NUM_IMAGES
 
 # import kornia
 from only_utils.only_sample import evolve_only_sampling
@@ -88,8 +89,13 @@ def parse_args():
     parser.add_argument("--ritual_beta", type=float, default=0.1)
     parser.add_argument("--js_gamma", type=float, default=0.1)
 
-    parser.add_argument("--num_eval_samples", type=int, default=500)
-    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--num_eval_samples", type=int, default=CHAIR_NUM_IMAGES)
+    parser.add_argument("--max_new_tokens", type=int, default=CHAIR_MAX_NEW_TOKENS)
+    parser.add_argument("--prompt", type=str, default=CHAIR_PROMPT)
+    parser.add_argument("--chair_seed", type=int, required=True, help="seed that selects the CHAIR images")
+    parser.add_argument("--image_list", type=str, default=None,
+                        help="json with the selected images; created on first use and reused afterwards")
+    parser.add_argument("--greedy", type=str2bool, default=True)
 
     args = parser.parse_known_args()[0]
     return args
@@ -126,11 +132,14 @@ def main():
     model_name = get_model_name_from_path(model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, None, model_name)
 
+    image_list = args.image_list or os.path.join(os.path.dirname(os.path.abspath(args.out_path)), f"chair_images_seed{args.chair_seed}.json")
+    img_files = select_chair_images(args.data_path, args.chair_seed, args.num_eval_samples, image_list)
     chair_dataset = CHAIRDataset(
         data_path=args.data_path,
         anno_path=args.anno_path,
         trans=image_processor,
-        model=args.model_base
+        model=args.model_base,
+        img_files=img_files,
     )
     chair_loader = DataLoader(
         chair_dataset, 
@@ -143,6 +152,12 @@ def main():
     os.makedirs(
         args.out_path, exist_ok=True
     )
+    decoding = "greedy" if args.greedy else "sample"
+    method_tag = args.method_name if args.use_only or args.use_vcd or args.use_ritual or args.use_m3id else "regular"
+    cap_file = os.path.join(args.out_path, f"{method_tag}_{decoding}_a{args.ritual_alpha_pos}_{args.ritual_alpha_neg}_b{args.ritual_beta}_g{args.js_gamma}_L{args.enhance_layer_index}_T{args.max_new_tokens}_seed{args.chair_seed}.jsonl")
+    finished = done_keys(cap_file, "image_id")
+    logger.info(f"captions -> {cap_file} ({len(finished)} already done)")
+    vision_tower = model.get_vision_tower()
 
 
 
@@ -160,11 +175,12 @@ def main():
             break
             
         img_id = data["image_id"]
+        if img_id.item() in finished:
+            continue
         image_path = data["image_path"]
         image = data["image"]
 
-
-        qs =  "Please describe this image in detail."
+        qs = args.prompt
 
         image_pos = None
         image_neg = None
@@ -212,6 +228,11 @@ def main():
         #             Image tensor setting
         # ==============================================
         input_ids = tokenizer_image_token(prompt_out, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+        if args.use_only:
+            # ONLY hard-codes the image span [35, 35+576) with BOS kept at index 0
+            img_pos = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero()
+            assert img_pos.numel() == 1 and img_pos.item() == 35 and vision_tower.num_patches == 576
+            assert input_ids[0, 0].item() == tokenizer.bos_token_id
 
         stop_str = conv_out.sep if conv_out.sep_style != SeparatorStyle.TWO else conv_out.sep2
 
@@ -225,7 +246,8 @@ def main():
                     images=image.unsqueeze(0).half().cuda(),
                     images_pos=(image_pos.unsqueeze(0).half().cuda() if image_pos is not None else None),
                     images_neg=(image_neg.unsqueeze(0).half().cuda() if image_neg is not None else None),
-                    do_sample=True,
+                    do_sample=True,  # routes to only_sample.sample; `greedy` picks argmax there
+                    greedy=args.greedy,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     top_k=args.top_k,
@@ -245,34 +267,23 @@ def main():
         print(f"Time: {t2-t1}")
                 
         input_token_len = input_ids.shape[1]
-        n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
-        if n_diff_input_output > 0:
-            print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
+        gen_ids = output_ids[0, input_token_len:].tolist()
+        # generated length in tokens, excluding the terminating EOS
+        num_tokens = len(gen_ids) - (1 if gen_ids and gen_ids[-1] == tokenizer.eos_token_id else 0)
         outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
         outputs = outputs.strip()
         if outputs.endswith(stop_str):
             outputs = outputs[:-len(stop_str)]
         outputs = outputs.strip()
 
-        print(f"[VQA for ritual]")
-        print(f"V: {image_path}")
-        print(f"Q: {qs}")
-        print(f"A: {outputs}")
-        print(f"="*50)
+        append_jsonl(cap_file, {
+            "image_id": img_id.item(),
+            "image": os.path.basename(image_path[0]),
+            "caption": outputs,
+            "num_tokens": num_tokens,
+            "time": t2 - t1,
+        })
 
-        img_save = {}
-        img_save["image_id"] = img_id.item()
-        img_save["caption"] = outputs
-
-        # dump metric file
-        with open(os.path.join(args.out_path, f"{args.ritual_alpha_pos}_{args.ritual_alpha_neg}_{args.ritual_beta}_{args.js_gamma}_{args.max_new_tokens}_{args.method_name}.jsonl"), "a") as f:
-            json.dump(img_save, f)
-            f.write('\n')
-
-        # write down time
-        with open(os.path.join(args.out_path, f"{args.ritual_alpha_pos}_{args.ritual_alpha_neg}_{args.ritual_beta}_{args.js_gamma}_{args.max_new_tokens}_{args.method_name}_time.txt"), "a") as f:
-            f.write(f"{t2-t1}\n")
-    
     # logger.info(vars(args))
 
     # if args.use_ritual:

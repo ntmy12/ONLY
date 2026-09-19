@@ -421,10 +421,10 @@ def load_generated_captions(cap_file, image_id_key:str, caption_key:str):
         raise ValueError(f'Unspported extension {ext} for cap_file: {cap_file}')
 
     # list of int
-    imids = [obj[image_id_key] for obj in caps][-500:]
+    imids = [obj[image_id_key] for obj in caps]
     
     # list of str
-    caps = [obj[caption_key] for obj in caps][-500:]
+    caps = [obj[caption_key] for obj in caps]
        
     return caps, imids
 

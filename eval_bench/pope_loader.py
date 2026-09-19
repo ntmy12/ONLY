@@ -24,12 +24,13 @@ class POPEDataSet(Dataset):
                     label_list.append(line['label'])
             
         else:
-            image_list, query_list, label_list = [], [], []
+            image_list, query_list, label_list, qid_list = [], [], [], []
             for q in open(pope_path, 'r'):
                 line = json.loads(q)
                 image_list.append(line['image'])
                 query_list.append(line['text'])
                 label_list.append(line['label'])
+                qid_list.append(line.get('question_id', len(qid_list)))
 
         for i in range(len(label_list)):
             if label_list[i] == 'no':
@@ -43,6 +44,7 @@ class POPEDataSet(Dataset):
         self.image_list = image_list
         self.query_list = query_list
         self.label_list = label_list
+        self.qid_list = qid_list if 'all' not in pope_path else list(range(len(label_list)))
 
     def __len__(self):
         return len(self.label_list)
@@ -55,7 +57,8 @@ class POPEDataSet(Dataset):
             image = self.trans.preprocess(raw_image, return_tensor='pt')['pixel_values'][0]
             query = self.query_list[index]
             label = self.label_list[index]
-            return {"image": image, "query": query, "label": label, "image_path": image_path} 
+            return {"image": image, "query": query, "label": label, "image_path": image_path,
+                    "question_id": self.qid_list[index]}
             
         elif self.model == 'qwen-vl':
             raw_image = Image.open(image_path).convert("RGB")

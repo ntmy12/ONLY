@@ -17,7 +17,6 @@ from transformers.generation.stopping_criteria import (
     validate_stopping_criteria,
 )
 import transformers
-from transformers.generation.utils import SampleOutput
 import torch.nn.functional as F
 
 
@@ -38,7 +37,7 @@ def sample(
     synced_gpus: bool = False,
     streamer: Optional["BaseStreamer"] = None,
     **model_kwargs,
-) -> Union[SampleOutput, torch.LongTensor]:
+) -> Union[Any, torch.LongTensor]:
     # init values
     logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
     stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
@@ -92,11 +91,11 @@ def sample(
     model_kwargs_pos = model_kwargs.copy()
     model_kwargs_neg = model_kwargs.copy()
     
-    print("use_ritual = ", model_kwargs.get("use_ritual"))
-    print("use_vcd = ", model_kwargs.get("use_vcd"))
-    print("use_m3id = ", model_kwargs.get("use_m3id"))
-    print("use_only = ", model_kwargs.get("use_only"))
-    
+    # `greedy=True` is passed through generate(**kwargs); generate() must still be called with
+    # do_sample=True so that it dispatches to this patched `sample`. Temperature/top-k/top-p warpers
+    # never change the argmax, so greedy here == argmax over the (contrastive) logits.
+    greedy = bool(model_kwargs.get("greedy", False))
+
     
     t=0
     total_overlapping_index_len = []
@@ -236,13 +235,20 @@ def sample(
             logits = logits_warper(input_ids, logits)
 
             next_token_scores = logits
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            if greedy:
+                # greedy: argmax on the same contrastive + APC-filtered scores
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+            else:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
         else:
             next_token_scores = logits_processor(input_ids, next_token_logits)
             next_token_scores = logits_warper(input_ids, next_token_scores)
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            if greedy:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+            else:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
         # Store scores, attentions and hidden_states when required
         if return_dict_in_generate:

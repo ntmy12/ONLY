@@ -1,0 +1,9 @@
+# Separate env for Qwen2-VL (the LLaVA code needs the transformers 4.31 fork in ./transformers).
+# only_utils/only_qwen2vl.py patches Qwen2VLAttention.forward verbatim from this exact version.
+torch>=2.1
+transformers==4.56.2
+accelerate
+pillow
+tqdm
+nltk
+pytest

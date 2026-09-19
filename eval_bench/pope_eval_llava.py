@@ -30,6 +30,7 @@ from PIL import Image
 from torchvision.transforms import v2
 
 from pope_loader import POPEDataSet
+from eval_common import pope_parse, binary_metrics, done_keys, append_jsonl, read_jsonl, write_json, YESNO_MAX_NEW_TOKENS
 
 # import kornia
 from only_utils.only_sample import evolve_only_sampling
@@ -83,65 +84,15 @@ def parse_args():
     parser.add_argument("--js_gamma", type=float, default=0.6)
 
     
-    parser.add_argument("--max_new_tokens", type=int, default=8)
+    parser.add_argument("--max_new_tokens", type=int, default=YESNO_MAX_NEW_TOKENS)
+    parser.add_argument("--greedy", type=str2bool, default=True)
+    parser.add_argument("--out_path", type=str, default="./results/pope")
     parser.add_argument("--type", type=str, default="random")
     parser.add_argument("--dataset_name", type=str, default="coco")
 
     args = parser.parse_args()
     return args
 
-
-def print_acc(pred_list, label_list, logger):
-    pos = 1
-    neg = 0
-    yes_ratio = pred_list.count(1) / len(pred_list)
-    # unknown_ratio = pred_list.count(2) / len(pred_list)
-
-    TP, TN, FP, FN = 0, 0, 0, 0
-    for pred, label in zip(pred_list, label_list):
-        if pred == pos and label == pos:
-            TP += 1
-        elif pred == pos and label == neg:
-            FP += 1
-        elif pred == neg and label == neg:
-            TN += 1
-        elif pred == neg and label == pos:
-            FN += 1
-
-    print('TP\tFP\tTN\tFN\t')
-    print('{}\t{}\t{}\t{}'.format(TP, FP, TN, FN))
-
-    if TP + FP == 0:
-        precision = 0
-    else:
-        precision = float(TP) / float(TP + FP)
-    if TP + FN == 0:
-        recall = 0
-    else:
-        recall = float(TP) / float(TP + FN)
-    if precision + recall == 0:
-        f1 = 0
-    else:
-        f1 = 2*precision*recall / (precision + recall)
-    acc = (TP + TN) / (TP + TN + FP + FN)
-
-    return acc, precision, recall, f1, yes_ratio
-
-def recorder(out, pred_list):
-    NEG_WORDS = ["No", "not", "no", "NO"]
-    for line in out.split('\n'):
-
-        line = line.replace('.', '')
-        line = line.replace(',', '')
-        words = line.split(' ')
-
-        if any(word in NEG_WORDS for word in words) or any(word.endswith("n't") for word in words):
-            pred_list.append(0)
-        else:
-            pred_list.append(1)
-        break
-    
-    return pred_list
 
 def main():
     args = parse_args()
@@ -165,12 +116,18 @@ def main():
             method_name = "ONLY"
         else:
             method_name = "Regular"
-        experiment_dir = f"{args.log_path}/pope/{model_string_name}/{method_name}_{args.dataset_name}_{args.type}_{args.ritual_alpha_pos}_{args.ritual_alpha_neg}_{args.ritual_beta}_{args.js_gamma}_layer_{args.enhance_layer_index}"  # Create an experiment folder
+        decoding = "greedy" if args.greedy else "sample"
+        experiment_dir = f"{args.out_path}/llava-1.5-7b/{method_name}/{args.dataset_name}_{args.type}"
+        run_tag = f"{decoding}_a{args.ritual_alpha_pos}_{args.ritual_alpha_neg}_b{args.ritual_beta}_g{args.js_gamma}_L{args.enhance_layer_index}_T{args.max_new_tokens}"
         os.makedirs(experiment_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
         logger = create_logger(None)
+    pred_file = f"{experiment_dir}/{run_tag}_predictions.jsonl"
+    metric_file = f"{experiment_dir}/{run_tag}_metrics.json"
+    finished = done_keys(pred_file, "question_id")
+    logger.info(f"predictions -> {pred_file} ({len(finished)} already done)")
 
     # ========================================
     #             Model & Dataset
@@ -218,39 +175,31 @@ def main():
     #            Start Generation
     # ========================================
     logger.info("Start eval...")
-    pred_list, label_list = [], []
-    non_hallu_jsd, hallu_jsd = [], []
+    vision_tower = model.get_vision_tower()
     for batch_id, data in tqdm(enumerate(pope_loader), total=len(pope_loader)):
-        # if batch_id > 100:
-        #     break
+        qid = data["question_id"][0]
+        qid = qid.item() if torch.is_tensor(qid) else qid
+        if qid in finished:
+            continue
         image = data["image"][0]
         qs = data["query"][0]
-        label = data["label"]
+        label = int(data["label"][0])
         image_path = data["image_path"]
-        label_list = label_list + list(label)
 
         image_pos = None
         image_neg = None
 
         if args.use_ritual:
-            # ==============================================
-            #              Image Transforms
-            # ==============================================
             raw_image = Image.open(image_path[0])
             pos_aug = random.choice(list(aug_dict.keys()))
-
             if pos_aug is not None:
                 raw_image_pos = aug_dict[pos_aug](raw_image)
-                image_pos = image_processor.preprocess(raw_image_pos, return_tensor='pt')['pixel_values'][0] 
+                image_pos = image_processor.preprocess(raw_image_pos, return_tensor='pt')['pixel_values'][0]
                 image_pos = torch.tensor(image_pos)
-                
             pos_aug_counter[pos_aug] += 1
-            # logger.info(f"RITUAL Transformation: {pos_aug}")
-            
         elif args.use_vcd:
             image_neg = add_diffusion_noise(image, args.noise_step)
-            
-        
+
         # ==============================================
         #              Text prompt setting
         # ==============================================
@@ -265,100 +214,73 @@ def main():
             sep=" ",
             sep2="</s>",
         )
-        
-        qu_out = DEFAULT_IMAGE_TOKEN + '\n' + qs # for opera? setting
-        # qu_out = DEFAULT_IMAGE_TOKEN + '\n' + qs + " Please answer this question with one word." # for VCD setting
+        # benchmark question verbatim (POPE protocol, also ONLY's own setting)
+        qu_out = DEFAULT_IMAGE_TOKEN + '\n' + qs
         conv_out.append_message(conv_out.roles[0], qu_out)
         conv_out.append_message(conv_out.roles[1], None)
         prompt_out = conv_out.get_prompt()
-        
+
         input_ids = tokenizer_image_token(prompt_out, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
         stop_str = conv_out.sep if conv_out.sep_style != SeparatorStyle.TWO else conv_out.sep2
 
-        # ==============================================
-        #                ritual method
-        # ==============================================
+        # ONLY's attention intervention hard-codes the image span as [35, 35+576) and keeps BOS (index 0)
+        # in the sequence; make sure this prompt matches that layout.
+        if args.use_only:
+            img_pos = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero()
+            assert img_pos.numel() == 1 and img_pos.item() == 35 and vision_tower.num_patches == 576, \
+                f"image span mismatch: start={img_pos.tolist()}, patches={vision_tower.num_patches}"
+            assert input_ids[0, 0].item() == tokenizer.bos_token_id
+
         with torch.inference_mode():
-            with torch.no_grad():
-                output_ids, overlapping_index_len = model.generate(
-                    input_ids,
-                    images=image.unsqueeze(0).half().cuda(),
-                    images_pos=(image_pos.unsqueeze(0).half().cuda() if image_pos is not None else None),
-                    images_neg=(image_neg.unsqueeze(0).half().cuda() if image_neg is not None else None),
-                    do_sample=True,
-                    temperature=args.temperature,# args.temperature
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    max_new_tokens=args.max_new_tokens,
-                    use_cache=True,
-                    use_ritual=args.use_ritual,
-                    use_vcd=args.use_vcd,
-                    use_m3id=args.use_m3id,
-                    use_only=args.use_only,
-                    enhance_layer_index=args.enhance_layer_index,
-                    ritual_alpha_pos=args.ritual_alpha_pos,
-                    ritual_alpha_neg=args.ritual_alpha_neg,
-                    ritual_beta=args.ritual_beta,
-                    js_gamma=args.js_gamma,
-                )
-                
+            output_ids, _ = model.generate(
+                input_ids,
+                images=image.unsqueeze(0).half().cuda(),
+                images_pos=(image_pos.unsqueeze(0).half().cuda() if image_pos is not None else None),
+                images_neg=(image_neg.unsqueeze(0).half().cuda() if image_neg is not None else None),
+                do_sample=True,  # routes to the patched only_sample.sample; `greedy` selects argmax there
+                greedy=args.greedy,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                max_new_tokens=args.max_new_tokens,
+                use_cache=True,
+                use_ritual=args.use_ritual,
+                use_vcd=args.use_vcd,
+                use_m3id=args.use_m3id,
+                use_only=args.use_only,
+                enhance_layer_index=args.enhance_layer_index,
+                ritual_alpha_pos=args.ritual_alpha_pos,
+                ritual_alpha_neg=args.ritual_alpha_neg,
+                ritual_beta=args.ritual_beta,
+                js_gamma=args.js_gamma,
+            )
+
         input_token_len = input_ids.shape[1]
-        n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
-        if n_diff_input_output > 0:
-            print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
         outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
         outputs = outputs.strip()
         if outputs.endswith(stop_str):
             outputs = outputs[:-len(stop_str)]
         outputs = outputs.strip()
-        pred_list = recorder(outputs, pred_list)
-        print(f"[VQA for ritual]")
-        print(f"V: {image_path}")
-        print(f"Q: {qs}")
-        print(f"A: {outputs}")
 
-        if label == 1: print(f"GT: Yes")
-        elif label == 0: print(f"GT: No")
+        append_jsonl(pred_file, {
+            "question_id": qid,
+            "image": os.path.basename(image_path[0]),
+            "question": qs,
+            "label": "yes" if label == 1 else "no",
+            "output": outputs,
+            "pred": pope_parse(outputs),
+        })
 
-        acc, precision, recall, f1, yes_ratio = print_acc(pred_list, label_list, logger)
-        acc = round(acc*100,2)
-        precision = round(precision*100,2)
-        recall = round(recall*100,2)
-        f1 = round(f1*100,2)
-        yes_ratio = round(yes_ratio*100,2)
-        print(
-            f"acc: {acc}, precision: {precision}, recall: {recall}, f1: {f1}, yes_ratio: {yes_ratio}"
-        )
-        
-        print(f"="*50)
-        # if pred_list[-1] == label_list[-1]:
-        #     print("Correct")
-        #     non_hallu_jsd.append(overlapping_index_len[0])
-        # else:
-        #     print('Wrong')
-        #     hallu_jsd.append(overlapping_index_len[0])
+    records = read_jsonl(pred_file)
+    assert len(records) == len(pope_dataset), f"{len(records)} predictions for {len(pope_dataset)} questions"
+    metrics = binary_metrics([r["pred"] for r in records], [r["label"] for r in records])
+    metrics["args"] = vars(args)
+    write_json(metric_file, metrics)
+    logger.info(
+        f"[{args.type}] acc: {metrics['Accuracy']:.2f}, precision: {metrics['Precision']:.2f}, "
+        f"recall: {metrics['Recall']:.2f}, f1: {metrics['F1']:.2f}, yes_ratio: {metrics['YesRatio']:.2f}"
+    )
 
-
-    if len(pred_list) != 0:
-        logger.info(vars(args))
-        # logger.info("Prompt for Aug:", prompt_aug)
-        # logger.info("Prompt for ritual:", prompt_out)
-        acc, precision, recall, f1, yes_ratio = print_acc(pred_list, label_list, logger)
-        
-        acc = round(acc*100,2)
-        precision = round(precision*100,2)
-        recall = round(recall*100,2)
-        f1 = round(f1*100,2)
-        yes_ratio = round(yes_ratio*100,2)
-        
-        logger.info(
-            f"acc: {acc}, precision: {precision}, recall: {recall}, f1: {f1}, yes_ratio: {yes_ratio}"
-        )
-        if args.use_ritual:
-            logger.info(f"RITUAL Transformation: {pos_aug_counter}")
-    with open ('tvdd.txt', 'w') as f:
-        f.write('non_hallu_jsd:'+ str(non_hallu_jsd)+'\n')
-        f.write('hallu_jsd:'+ str(hallu_jsd))
 
 if __name__ == "__main__":
     main()
