@@ -58,6 +58,20 @@ if eos_token_id is None and hasattr(self.processor, "tokenizer"):
     eos_token_id = getattr(self.processor.tokenizer, "eos_token_id", None)
 ```
 
+### Phòng ngừa lỗi `AttributeError: 'LlavaForConditionalGeneration' object has no attribute 'language_model'`:
+Tùy thuộc phiên bản Hugging Face `transformers` trên Kaggle, kiến trúc nội bộ của `LlavaForConditionalGeneration` có thể lưu language backbone ở `model.language_model`, hoặc bên trong submodule `model.model.language_model` (khi `model.model` là `LlavaModel`), hoặc thông qua `model.get_decoder()`.
+Trong `only_utils/only_llava.py` và `only_utils/only_qwen2vl.py`, cơ chế truy xuất an toàn đã được cài đặt:
+```python
+if hasattr(model, "language_model") and model.language_model is not None:
+    lm = model.language_model
+elif hasattr(model, "model") and hasattr(model.model, "language_model") and model.model.language_model is not None:
+    lm = model.model.language_model
+elif hasattr(model, "get_decoder") and callable(model.get_decoder):
+    lm = model.get_decoder()
+elif hasattr(model, "model") and hasattr(model.model, "layers"):
+    lm = model.model
+```
+
 ---
 
 ## 🛠️ 3. Cấu trúc Codebase Mới

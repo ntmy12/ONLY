@@ -146,15 +146,51 @@ class OnlyLlava:
         self.model = model
         self.state = OnlyLlavaState()
         
-        # Access language model components in LlavaForConditionalGeneration
-        lm = model.language_model
-        if hasattr(lm, "model"):
-            layers = lm.model.layers
-            self.norm = lm.model.norm
+        # Robust resolution of language model / text backbone across transformers versions
+        lm = None
+        if hasattr(model, "language_model") and model.language_model is not None:
+            lm = model.language_model
+        elif hasattr(model, "model") and hasattr(model.model, "language_model") and model.model.language_model is not None:
+            lm = model.model.language_model
+        elif hasattr(model, "get_decoder") and callable(model.get_decoder):
+            lm = model.get_decoder()
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            lm = model.model
         else:
+            raise AttributeError(
+                f"Cannot locate language_model in {type(model).__name__}. "
+                f"Available attributes: {[a for a in dir(model) if not a.startswith('_')]}"
+            )
+
+        # Resolve decoder layers and final layer norm
+        if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+            layers = lm.model.layers
+            self.norm = getattr(lm.model, "norm", None)
+        elif hasattr(lm, "layers"):
             layers = lm.layers
-            self.norm = lm.norm
-        self.lm_head = getattr(lm, "lm_head", None) or getattr(model, "lm_head", None)
+            self.norm = getattr(lm, "norm", None)
+        elif hasattr(lm, "get_decoder") and callable(lm.get_decoder):
+            dec = lm.get_decoder()
+            layers = dec.layers
+            self.norm = getattr(dec, "norm", None)
+        else:
+            raise AttributeError(
+                f"Cannot find layers in language model {type(lm).__name__}. "
+                f"Available attributes: {[a for a in dir(lm) if not a.startswith('_')]}"
+            )
+
+        if self.norm is None:
+            for candidate in [lm, getattr(lm, "model", None), model, getattr(model, "model", None)]:
+                if candidate is not None and hasattr(candidate, "norm"):
+                    self.norm = candidate.norm
+                    break
+
+        self.lm_head = (
+            getattr(model, "lm_head", None)
+            or getattr(lm, "lm_head", None)
+            or getattr(getattr(model, "model", None), "lm_head", None)
+            or (model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None)
+        )
         self.enhance_layer_index = enhance_layer_index
         self.last_index = len(layers) - 1
 

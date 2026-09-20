@@ -92,5 +92,37 @@ def test_only_llava_hooks_and_generation():
     print("[PASSED] test_only_llava_hooks_and_generation PASSED!")
 
 
+class LlavaWithoutLanguageModelAttr:
+    """Simulates transformers versions where LlavaForConditionalGeneration has no .language_model attribute."""
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        if name == "language_model":
+            raise AttributeError("'LlavaForConditionalGeneration' object has no attribute 'language_model'")
+        return getattr(self._inner, name)
+
+
+def test_only_llava_fallback_resolution():
+    model = tiny_llava_model()
+    wrapped_model = LlavaWithoutLanguageModelAttr(model)
+
+    # Verify simulated condition
+    try:
+        _ = wrapped_model.language_model
+        assert False, "Should have raised AttributeError"
+    except AttributeError:
+        pass
+
+    # OnlyLlava must successfully initialize via fallback resolution
+    only = OnlyLlava(wrapped_model, enhance_layer_index=0)
+    assert only.norm is not None
+    assert only.lm_head is not None
+    only.remove()
+    print("[PASSED] test_only_llava_fallback_resolution PASSED!")
+
+
 if __name__ == "__main__":
     test_only_llava_hooks_and_generation()
+    test_only_llava_fallback_resolution()
+
