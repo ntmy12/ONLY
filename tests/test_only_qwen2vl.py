@@ -5,7 +5,18 @@ python -m pytest tests/test_only_qwen2vl.py -q
 import os
 import sys
 
-import pytest
+os.environ["USE_TF"] = "0"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+try:
+    import pytest
+except ImportError:
+    class DummyMark:
+        def parametrize(self, *args, **kwargs):
+            return lambda fn: fn
+    class DummyPytest:
+        mark = DummyMark()
+    pytest = DummyPytest()
 import torch
 from torch import nn
 from transformers import LogitsProcessorList, Qwen2VLConfig, Qwen2VLForConditionalGeneration
@@ -149,3 +160,17 @@ def test_logits_cd_matches_manual_composition():
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(out.logits[:, -1, :], model.lm_head(hs[-1][:, -1:, :])[:, -1, :])
     only.remove()
+
+
+if __name__ == "__main__":
+    print("Running test_cd_last_row_matches_full_reference...")
+    test_cd_last_row_matches_full_reference()
+    print("Running test_patch_does_not_change_main_branch...")
+    for impl in ["eager", "sdpa"]:
+        test_patch_does_not_change_main_branch(impl)
+    print("Running test_degenerate_only_equals_greedy...")
+    for impl in ["eager", "sdpa"]:
+        test_degenerate_only_equals_greedy(impl)
+    print("Running test_logits_cd_matches_manual_composition...")
+    test_logits_cd_matches_manual_composition()
+    print("[PASSED] All test_only_qwen2vl tests PASSED!")

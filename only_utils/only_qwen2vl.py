@@ -111,9 +111,17 @@ def _make_patched_attention_forward(attn, state):
         value_states = value_states.view(bsz, q_len, -1, attn.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = mq.apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin
+        mrope_section = getattr(attn, "rope_scaling", {}).get("mrope_section") if hasattr(attn, "rope_scaling") and isinstance(attn.rope_scaling, dict) else (
+            getattr(attn.config, "rope_scaling", {}).get("mrope_section") if hasattr(attn.config, "rope_scaling") and isinstance(attn.config.rope_scaling, dict) else None
         )
+        if mrope_section is not None:
+            query_states, key_states = mq.apply_multimodal_rotary_pos_emb(
+                query_states, key_states, cos, sin, mrope_section
+            )
+        else:
+            query_states, key_states = mq.apply_multimodal_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, attn.layer_idx, cache_kwargs)
@@ -168,7 +176,8 @@ class OnlyQwen2VL:
                 # LLaVA reference: the 'get hidden states' branch wins, no last-layer processing
                 state.cd_final = state.cd
                 return
-            cd = module.input_layernorm(state.cd)
+            cd = state.cd.to(state.residual.device)
+            cd = module.input_layernorm(cd)
             cd = 0.2 * state.residual + cd
             residual_cd = cd
             cd = module.post_attention_layernorm(cd)
@@ -193,10 +202,11 @@ class OnlyQwen2VL:
 
     def logits_cd(self):
         s = self.state
+        device = self.lm_head.weight.device
         h_norm = s.h_norm                    # read first: calling self.norm below re-fires norm_hook
-        cd_norm = self.norm(s.cd_final)
+        cd_norm = self.norm(s.cd_final.to(self.norm.weight.device))
         s.h_norm = h_norm
-        return self.lm_head(cd_norm + 0.5 * h_norm)[:, -1, :]
+        return self.lm_head(cd_norm.to(device) + 0.5 * h_norm.to(device))[:, -1, :]
 
     def remove(self):
         for h in self._handles:
@@ -213,7 +223,7 @@ class OnlyLogitsProcessor(LogitsProcessor):
 
     def __call__(self, input_ids, scores):
         next_token_logits = scores
-        next_token_logits_cd = self.only.logits_cd().to(scores.dtype)
+        next_token_logits_cd = self.only.logits_cd().to(scores.device, dtype=scores.dtype)
         cutoff = math.log(self.beta) + next_token_logits.max(dim=-1, keepdim=True).values
         tvd = torch.sum(torch.abs(nn.functional.softmax(next_token_logits, dim=-1)
                                   - nn.functional.softmax(next_token_logits_cd, dim=-1)))

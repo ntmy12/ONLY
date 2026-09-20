@@ -34,29 +34,58 @@ def pope_parse(text):
     return "no" if ("No" in words or "not" in words or "no" in words) else "yes"
 
 
+def pope_parse_extended(text):
+    """Parses model output into 'yes', 'no', or 'unknown'."""
+    text_first = text.split(".")[0] if "." in text else text
+    text_clean = text_first.replace(",", " ").replace("!", " ").replace("?", " ").strip()
+    words = [w.lower() for w in text_clean.split()]
+    has_yes = "yes" in words
+    has_no = ("no" in words or "not" in words)
+    if has_yes and not has_no:
+        return "yes"
+    if has_no and not has_yes:
+        return "no"
+    # Fallback to standard POPE rule if ambiguous
+    return pope_parse(text)
+
+
 def binary_metrics(preds, labels):
-    """preds/labels: iterables of 'yes'/'no'. Returns percentages + raw counts."""
-    tp = fp = tn = fn = 0
+    """preds/labels: iterables of 'yes'/'no'/'unknown'. Returns percentages + raw counts."""
+    tp = fp = tn = fn = unknowns = 0
     for p, l in zip(preds, labels):
-        if p == "yes" and l == "yes":
+        p_clean = str(p).lower().strip()
+        l_clean = str(l).lower().strip()
+        if p_clean not in ("yes", "no"):
+            unknowns += 1
+            if l_clean == "yes":
+                fn += 1
+            else:
+                fp += 1
+        elif p_clean == "yes" and l_clean == "yes":
             tp += 1
-        elif p == "yes" and l == "no":
+        elif p_clean == "yes" and l_clean == "no":
             fp += 1
-        elif p == "no" and l == "no":
+        elif p_clean == "no" and l_clean == "no":
             tn += 1
-        else:
+        elif p_clean == "no" and l_clean == "yes":
             fn += 1
+
     n = tp + fp + tn + fn
-    prec = tp / (tp + fp) if tp + fp else 0.0
-    rec = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
     return {
         "Accuracy": 100 * (tp + tn) / n if n else 0.0,
         "Precision": 100 * prec,
         "Recall": 100 * rec,
         "F1": 100 * f1,
         "YesRatio": 100 * (tp + fp) / n if n else 0.0,
-        "TP": tp, "FP": fp, "TN": tn, "FN": fn, "N": n,
+        "TP": tp,
+        "FP": fp,
+        "TN": tn,
+        "FN": fn,
+        "Unknowns": unknowns,
+        "Total": n,
     }
 
 

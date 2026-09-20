@@ -1,42 +1,127 @@
-# Yêu cầu và Bối cảnh: Triển khai can thiệp OPERA cho benchmark POPE
+# Hướng dẫn Vận hành & Bàn giao: POPE Benchmark cho ONLY trên Kaggle (2× T4 GPU, BF16)
 
-## 🎯 Mục tiêu chính
-Chạy đánh giá benchmark POPE cho các mô hình (ví dụ: LLaVA, Qwen-VL) trên cả 3 tập dữ liệu con là **adversarial**, **random**, và **popular**, đồng thời áp dụng phương pháp can thiệp **OPERA** (Over-Trust Penalty and Retrospection-Allocation).
-
----
-
-## 🔍 Bối cảnh hiện tại (Context)
-* **Thư mục làm việc:** Dự án hiện tại (`ONLY`) là một framework dùng để đánh giá các phương pháp can thiệp (intervention) nhằm giảm thiểu hallucination trên các Large Vision-Language Models (LVLMs).
-* **Các phương pháp đã có:** Codebase hiện đã hỗ trợ sẵn các thuật toán như RITUAL, VCD, M3ID, và ONLY.
-* **Cấu trúc luồng chạy:** 
-  * Các script python chạy đánh giá POPE nằm ở thư mục `eval_bench/` (ví dụ: `eval_bench/pope_eval_llava.py`). Các file này parse các cờ (flags) như `--use_ritual`, `--use_vcd`... và truyền chúng vào hàm `model.generate()`.
-  * Các shell script để chạy hàng loạt nằm ở `eval_bench/scripts/` (ví dụ: `eval_bench/scripts/pope_eval.sh`).
-* **Cách codebase can thiệp vào model:** Dự án sử dụng kỹ thuật "monkey patch" hàm sinh văn bản của thư viện Transformers. File `only_utils/only_sample.py` đang patch hàm `sample` của `transformers.generation.utils.GenerationMixin` để chèn logic của RITUAL, VCD, M3ID và ONLY.
-* **Tình trạng OPERA:** Hiện tại, logic thuật toán OPERA **chưa được implement** trong repository này.
-* **Decoding method:** Code đang được thiết lập để chạy **greedy decoding** mặc định cho tất cả các framework can thiệp.
+Tài liệu hướng dẫn chi tiết quy trình chuẩn hóa và thực thi benchmark **POPE (Random, Popular, Adversarial)** cho phương pháp **ONLY** (ICCV'25) trên môi trường **Kaggle Notebooks** (2× GPU NVIDIA Tesla T4 16GB, BF16 Full Precision).
 
 ---
 
-## 📋 Yêu cầu công việc cho Agent tiếp theo (Next Steps)
+## 🎯 1. Mục tiêu & Các mô hình hỗ trợ
+- **POPE Splits**: `random`, `popular`, `adversarial` (hoặc `--split all` chạy tuần tự).
+- **Mô hình**:
+  - **LLaVA-1.5-7B**: Checkpoint HuggingFace `llava-hf/llava-1.5-7b-hf` via `LlavaForConditionalGeneration`.
+  - **Qwen2-VL-7B-Instruct**: Checkpoint HuggingFace `Qwen/Qwen2-VL-7B-Instruct` via `Qwen2VLForConditionalGeneration`.
+- **Phương pháp**: Can thiệp giảm thiểu hallucination **ONLY** (`--use_only True`) hoặc baseline (`--use_only False`).
 
-**1. Tích hợp thuật toán OPERA (Phần cốt lõi)**
-* **Vị trí cần xử lý:** Cần thiết kế logic can thiệp của OPERA (thường liên quan đến việc tính toán attention maps, áp dụng over-trust penalty và retrospection-allocation trong quá trình giải mã).
-* **Cách thực hiện:** Bạn có thể tham khảo cách codebase đang làm ở `only_utils/only_sample.py` để patch hàm generate của HuggingFace, hoặc tạo một file utility mới như `only_utils/opera_utils.py` để xử lý việc ghi đè logic decoding riêng cho OPERA (vì OPERA thường dùng dạng beam search sửa đổi thay vì chỉ can thiệp vào logits).
+---
 
-**2. Cập nhật các file Python đánh giá (Evaluation Scripts)**
-* **File cần sửa:** `eval_bench/pope_eval_llava.py` (và các mô hình khác nếu cần).
-* **Chi tiết:**
-  * Thêm cờ `--use_opera` (kiểu boolean) vào `argparse`.
-  * Thêm cấu hình các siêu tham số (hyperparameters) đặc thù của OPERA (ví dụ: scale factor, penalty...).
-  * Cập nhật logic tạo thư mục log: `elif args.use_opera: method_name = "OPERA"`.
-  * Truyền biến `use_opera=args.use_opera` vào `model.generate(...)`.
+## ⚠️ 2. Cảnh báo quan trọng về Dependencies & Môi trường Kaggle
+> [!CAUTION]
+> **Tuyệt đối KHÔNG chạy `pip install -r requirements.txt` trên Kaggle!**
+> File `requirements.txt` cũ chứa các phiên bản cổ điển (`torch==2.0.1`, `torchvision==0.15.2`, `torchaudio`, `transformers==4.31.0`).
+> Nếu chạy lệnh này, pip sẽ hạ cấp PyTorch làm hỏng driver CUDA và gây ra lỗi nghiêm trọng:
+> `RuntimeError: Detected that PyTorch and TorchAudio were compiled with different CUDA versions`
 
-**3. Tạo hoặc cập nhật Bash Script**
-* **File cần sửa:** Có thể sửa `eval_bench/scripts/pope_eval.sh` hoặc tạo một bản sao mới (ví dụ: `pope_eval_opera.sh`).
-* **Chi tiết:** 
-  * Viết một vòng lặp (for loop) để tự động chạy qua 3 tập dữ liệu: `for type in "random" "popular" "adversarial"; do ... done`.
-  * Bật cờ `--use_opera True` và cấu hình các tham số môi trường hoặc tham số thuật toán cần thiết.
+### Cấu hình chuẩn Cell 1 (BẮT BUỘC):
+```python
+# 1. Gỡ bỏ torchaudio (dự án chỉ dùng Ảnh + Chữ, gỡ bỏ để tránh 100% xung đột CUDA mismatch)
+!pip uninstall -y -q torchaudio
 
-**4. Chạy kiểm thử (Testing)**
-* Chạy thử script với một batch size nhỏ để đảm bảo hàm generate không bị crash khi có sự can thiệp của OPERA.
-* Kiểm tra xem các file `*_predictions.jsonl` và `*_metrics.json` có được sinh ra chính xác tại `results/pope/{model}/OPERA/` hay không.
+# 2. Cài đặt các thư viện cần thiết (KHÔNG cài torch/torchvision để giữ nguyên driver CUDA của Kaggle)
+!pip install -q --no-cache-dir \
+    "transformers>=4.45.0" \
+    "accelerate>=0.26.0" \
+    sentencepiece \
+    protobuf \
+    tiktoken \
+    qwen_vl_utils \
+    pyyaml \
+    tqdm \
+    huggingface_hub \
+    pandas
+
+# 3. Dòng kiểm tra xác thực dependency:
+import torch, transformers, accelerate, qwen_vl_utils, sentencepiece
+from transformers import AutoProcessor, AutoTokenizer
+print(f"✅ Dependency Verification PASSED! PyTorch: {torch.__version__} (CUDA: {torch.cuda.is_available()}) | Transformers: {transformers.__version__}")
+```
+
+### Phòng ngừa lỗi `AttributeError: 'LlavaConfig' object has no attribute 'eos_token_id'`:
+Trên `transformers >= 4.45.0`, `LlavaConfig` không còn attribute `eos_token_id`.
+Hàm `resolve_eos_token_id()` trong `eval_bench/eval_pope.py` đã cài đặt cơ chế fallback an toàn:
+```python
+eos_token_id = getattr(self.model, "generation_config", None)
+eos_token_id = getattr(eos_token_id, "eos_token_id", None) if eos_token_id else None
+if eos_token_id is None and hasattr(self.model, "config"):
+    eos_token_id = getattr(self.model.config, "eos_token_id", None)
+if eos_token_id is None and hasattr(self.model.config, "text_config"):
+    eos_token_id = getattr(self.model.config.text_config, "eos_token_id", None)
+if eos_token_id is None and hasattr(self.processor, "tokenizer"):
+    eos_token_id = getattr(self.processor.tokenizer, "eos_token_id", None)
+```
+
+---
+
+## 🛠️ 3. Cấu trúc Codebase Mới
+
+| File | Mô tả |
+| :--- | :--- |
+| `only_utils/only_llava.py` | Implementation sạch của ONLY cho LLaVA-1.5 trên `transformers >= 4.45.0` bằng PyTorch hooks và LogitsProcessor. Hỗ trợ multi-GPU `device_map="auto"`. |
+| `only_utils/only_qwen2vl.py` | Implementation của ONLY cho Qwen2-VL, đã bổ sung bảo vệ an toàn phân bổ thiết bị đa GPU và `mrope_section`. |
+| `eval_bench/eval_pope.py` | Trình thực thi trung tâm POPE: nạp model 1 lần duy nhất, hỗ trợ `--split all`, greedy `max_new_tokens=6`, tự động thêm prompt suffix cho QwenVL. |
+| `eval_bench/pope_auto_detect.py` | Tự động phát hiện ảnh COCO val2014 (`/kaggle/input/datasets/biminhco/val2014/val2014` hoặc quét đệ quy) và POPE annotations (tự tải từ GitHub nếu thiếu). |
+| `eval_bench/eval_common.py` | Bổ sung hàm `pope_parse_extended` nhận diện yes/no/unknown và cập nhật `binary_metrics` theo dõi `Unknowns`. |
+| `kaggle_only_pope.ipynb` | Notebook Kaggle 8 cell hoàn chỉnh từ setup, login, clone, verify GPU/path, chạy benchmark `--split all`, đến hiển thị DataFrame. |
+| `requirements_kaggle.txt` | Danh sách package an toàn cho Kaggle. |
+| `tests/test_only_llava.py` | CPU unit test cho `OnlyLlava`. |
+| `tests/test_only_qwen2vl.py` | CPU unit test cho `OnlyQwen2VL`. |
+
+---
+
+## 🚀 4. Hướng dẫn Chạy Benchmark
+
+### Chạy qua Kaggle Notebook:
+1. Mở Kaggle, tạo một Notebook mới với Accelerator: **GPU T4 x 2**, Internet: **Always On**.
+2. Upload hoặc import notebook [`kaggle_only_pope.ipynb`](file:///c:/Project_files/VLM_Hallulu/reference_codebases/ONLY/kaggle_only_pope.ipynb).
+3. Đính kèm dataset ảnh COCO val2014 (`datasets/biminhco/val2014`).
+4. Thêm Secret `HF_TOKEN` trong mục **Add-ons -> Secrets** (nếu cần tải checkpoint cá nhân).
+5. Chọn mô hình tại Cell 6 (`MODEL_CHOICE = "llava"` hoặc `"qwen2vl"`) và nhấn **Run All**.
+
+### Chạy trực tiếp qua dòng lệnh:
+```bash
+# LLaVA-1.5 7B (ONLY method, cả 3 split)
+python eval_bench/eval_pope.py \
+    --model llava \
+    --split all \
+    --use_only True \
+    --max_new_tokens 6 \
+    --device_map auto \
+    --precision bfloat16
+
+# Qwen2-VL 7B (ONLY method, cả 3 split)
+python eval_bench/eval_pope.py \
+    --model qwen2vl \
+    --split all \
+    --use_only True \
+    --max_new_tokens 6 \
+    --device_map auto \
+    --precision bfloat16
+```
+
+---
+
+## 📊 5. Cấu trúc Kết quả & Bảng Báo cáo
+Mỗi lần chạy sẽ sinh thư mục: `results/<model>_<method>_pope_<timestamp>/`:
+- `<split>/raw_outputs.jsonl`: Từng câu hỏi, câu trả lời, nhãn gốc, và nhãn dự đoán.
+- `<split>/run_config.json`: Cấu hình siêu tham số, seed, thời gian chạy.
+- `<split>/metrics.json`: Accuracy, Precision, Recall, F1, YesRatio, Unknowns, Total.
+- `summary_metrics.csv`: Bảng tổng hợp DataFrame hiển thị ra console:
+```
+================================================================================
+                          POPE BENCHMARK SUMMARY
+================================================================================
+      Split  Accuracy  Precision  Recall    F1  YesRatio  Unknowns  Total
+     random     88.20      86.50   90.50 88.45     52.30         0   3000
+    popular     85.10      83.20   88.10 85.58     53.00         0   3000
+adversarial     83.40      81.00   87.20 83.98     53.80         0   3000
+    Average     85.57      83.57   88.60 86.00     53.03         0   9000
+================================================================================
+```
