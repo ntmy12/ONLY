@@ -101,31 +101,42 @@ def _make_patched_llama_attention_forward(attn, state):
         past_key_values = kwargs.get("past_key_values", kwargs.get("past_key_value"))
 
         bsz, q_len, _ = hidden_states.size()
-        query_states = attn.q_proj(hidden_states)
-        key_states = attn.k_proj(hidden_states)
-        value_states = attn.v_proj(hidden_states)
-
         num_heads = attn.config.num_attention_heads if hasattr(attn, "config") else attn.num_heads
         num_kv_heads = attn.config.num_key_value_heads if hasattr(attn, "config") else getattr(attn, "num_key_value_heads", num_heads)
         head_dim = attn.head_dim
 
-        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        # Fast path: reuse cached key/value from past_key_values updated by orig_forward
+        has_cached_kv = False
+        if past_key_values is not None:
+            if hasattr(past_key_values, "key_cache") and len(past_key_values.key_cache) > attn.layer_idx:
+                key_states = past_key_values.key_cache[attn.layer_idx]
+                value_states = past_key_values.value_cache[attn.layer_idx]
+                has_cached_kv = True
+            elif isinstance(past_key_values, (list, tuple)) and len(past_key_values) >= 2:
+                key_states = past_key_values[0]
+                value_states = past_key_values[1]
+                has_cached_kv = True
+
+        if not has_cached_kv:
+            key_states = attn.k_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+            value_states = attn.v_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        # Only last query token position is used by only_attention_cd_llama
+        query_states = attn.q_proj(hidden_states[:, -1:, :]).view(bsz, 1, num_heads, head_dim).transpose(1, 2)
 
         if position_embeddings is not None:
             from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if cos.shape[-2] > 1:
+                cos_last = cos[:, -1:, :]
+                sin_last = sin[:, -1:, :]
+            else:
+                cos_last, sin_last = cos, sin
 
-        if past_key_values is not None:
-            # past_key_values already contains the updated keys/values from orig_forward!
-            if hasattr(past_key_values, "key_cache") and len(past_key_values.key_cache) > attn.layer_idx:
-                key_states = past_key_values.key_cache[attn.layer_idx]
-                value_states = past_key_values.value_cache[attn.layer_idx]
-            elif isinstance(past_key_values, (list, tuple)) and len(past_key_values) >= 2:
-                key_states = past_key_values[0]
-                value_states = past_key_values[1]
+            if not has_cached_kv:
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos_last, sin)
+            else:
+                query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos_last, sin_last)
 
         state.cd = only_attention_cd_llama(
             attn, query_states, key_states, value_states, attention_mask,

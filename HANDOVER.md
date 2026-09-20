@@ -108,7 +108,7 @@ python eval_bench/eval_pope.py \
     --use_only True \
     --max_new_tokens 6 \
     --device_map auto \
-    --precision bfloat16
+    --precision auto
 
 # Qwen2-VL 7B (ONLY method, cả 3 split)
 python eval_bench/eval_pope.py \
@@ -117,7 +117,7 @@ python eval_bench/eval_pope.py \
     --use_only True \
     --max_new_tokens 6 \
     --device_map auto \
-    --precision bfloat16
+    --precision auto
 ```
 
 ---

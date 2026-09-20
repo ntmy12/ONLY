@@ -59,7 +59,10 @@ def parse_args():
     p.add_argument("--model_path", default=None,
                    help="HuggingFace checkpoint name or local path (defaults to official HF repos)")
     p.add_argument("--device_map", default="auto", help="device_map for accelerate (default: 'auto')")
-    p.add_argument("--precision", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--precision", default="auto", choices=["auto", "bfloat16", "float16", "float32"],
+                   help="Precision: 'auto' (BF16 on Ampere+, FP16 Tensor Cores on T4/Volta), or explicit 'bfloat16', 'float16', 'float32'")
+    p.add_argument("--run_dir", default=None,
+                   help="Explicit output directory for results (enables seamless resuming across Kaggle sessions)")
 
     # Benchmark protocol
     p.add_argument("--split", default="all", choices=["all", "random", "popular", "adversarial"],
@@ -110,20 +113,40 @@ class PopeEvaluator:
             else:
                 args.model_path = "Qwen/Qwen2-VL-7B-Instruct"
 
-        dtype_map = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }
-        torch_dtype = dtype_map[args.precision]
+        if args.precision == "auto":
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                torch_dtype = torch.bfloat16
+                precision_desc = "bfloat16 (Hardware Native)"
+            elif torch.cuda.is_available():
+                torch_dtype = torch.float16
+                precision_desc = "float16 (Hardware Tensor Cores for T4/Volta)"
+            else:
+                torch_dtype = torch.float32
+                precision_desc = "float32 (CPU)"
+        else:
+            dtype_map = {
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
+            }
+            torch_dtype = dtype_map[args.precision]
+            precision_desc = args.precision
 
         print(f"\n=======================================================")
         print(f"Loading {args.model.upper()} from {args.model_path}")
-        print(f"Device Map: {args.device_map} | Precision: {args.precision}")
+        print(f"Device Map: {args.device_map} | Precision: {precision_desc}")
         print(f"ONLY Intervention: {args.use_only}")
         print(f"=======================================================\n")
 
-        self.processor = AutoProcessor.from_pretrained(args.model_path)
+        if args.model == "qwen2vl":
+            # Restrict max_pixels to 313600 to prevent vision token explosion
+            self.processor = AutoProcessor.from_pretrained(
+                args.model_path,
+                min_pixels=256 * 28 * 28,
+                max_pixels=313600,
+            )
+        else:
+            self.processor = AutoProcessor.from_pretrained(args.model_path)
 
         if args.model == "llava":
             self.model = LlavaForConditionalGeneration.from_pretrained(
@@ -267,6 +290,9 @@ def run_split(evaluator, split, data_path, pope_file, run_dir):
 
     print(f"\n--- Evaluating Split: {split.upper()} ({len(items)} questions, {len(finished_qids)} already done) ---")
 
+    cached_image = None
+    cached_image_path = None
+
     for i, item in enumerate(tqdm(items, desc=f"POPE {split}")):
         qid = item.get("question_id", i)
         if qid in finished_qids:
@@ -277,11 +303,17 @@ def run_split(evaluator, split, data_path, pope_file, run_dir):
         question = item["text"]
         label = item["label"]
 
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            print(f"Error loading image {image_path}: {e}")
-            continue
+        # Cache opened image to eliminate 83% of disk I/O on repeated image queries
+        if image_path == cached_image_path and cached_image is not None:
+            image = cached_image
+        else:
+            try:
+                image = Image.open(image_path).convert("RGB")
+                cached_image = image
+                cached_image_path = image_path
+            except Exception as e:
+                print(f"Error loading image {image_path}: {e}")
+                continue
 
         output_text = evaluator.generate(image, question)
         pred = pope_parse_extended(output_text)
@@ -296,6 +328,9 @@ def run_split(evaluator, split, data_path, pope_file, run_dir):
             "text": output_text,
         }
         append_jsonl(raw_file, record)
+
+        if torch.cuda.is_available() and (i % 500 == 0):
+            torch.cuda.empty_cache()
 
     # Compute metrics
     all_records = read_jsonl(raw_file)
@@ -319,10 +354,13 @@ def main():
     else:
         splits = [args.split]
 
-    # Create run output directory with timestamp
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    method_name = "only" if args.use_only else "baseline"
-    run_dir = os.path.join(args.out_path, f"{args.model}_{method_name}_pope_{timestamp}")
+    # Create run output directory (supports resuming via --run_dir)
+    if args.run_dir:
+        run_dir = os.path.abspath(args.run_dir)
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        method_name = "only" if args.use_only else "baseline"
+        run_dir = os.path.join(args.out_path, f"{args.model}_{method_name}_pope_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     print(f"[Results Directory] {os.path.abspath(run_dir)}")
 
